@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BTC 5-Min Signal Dashboard</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%); min-height: 100vh; font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace; color: #e2e8f0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // Multiple API sources - tries each until one works
+    const APIS = [
+      {
+        name: "Bybit",
+        price: () => fetch("https://api.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT").then(r => r.json()).then(d => parseFloat(d.result.list[0].lastPrice)),
+        klines: () => fetch("https://api.bybit.com/v5/market/kline?category=spot&symbol=BTCUSDT&interval=5&limit=50").then(r => r.json()).then(d =>
+          d.result.list.reverse().map(k => ({ t: +k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] }))
+        )
+      },
+      {
+        name: "Kraken",
+        price: () => fetch("https://api.kraken.com/0/public/Ticker?pair=XBTUSD").then(r => r.json()).then(d => { const key = Object.keys(d.result)[0]; return parseFloat(d.result[key].c[0]); }),
+        klines: () => fetch("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=5").then(r => r.json()).then(d => {
+          const key = Object.keys(d.result).find(k => k !== "last");
+          return d.result[key].slice(-50).map(k => ({ t: k[0]*1000, o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[6] }));
+        })
+      },
+      {
+        name: "CoinGecko",
+        price: () => fetch("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd").then(r => r.json()).then(d => d.bitcoin.usd),
+        klines: () => fetch("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=0.18&precision=2").then(r => r.json()).then(d => {
+          const prices = d.prices;
+          const result = [];
+          for (let i = 0; i < prices.length; i += 5) {
+            const chunk = prices.slice(i, Math.min(i+5, prices.length));
+            if (chunk.length === 0) continue;
+            const cls = chunk.map(c => c[1]);
+            result.push({ t: chunk[0][0], o: cls[0], h: Math.max(...cls), l: Math.min(...cls), c: cls[cls.length-1], v: 0 });
+          }
+          return result.length > 3 ? result : prices.map((p,i) => ({ t: p[0], o: p[1], h: p[1]*1.0001, l: p[1]*0.9999, c: p[1], v: 0 }));
+        })
+      }
+    ];
+
+    function calcEMA(prices, period) {
+      const k = 2 / (period + 1); let ema = prices[0]; const r = [ema];
+      for (let i = 1; i < prices.length; i++) { ema = prices[i]*k + ema*(1-k); r.push(ema); } return r;
+    }
+
+    function calcRSI(prices, period = 14) {
+      if (prices.length < period + 1) return null;
+      let gains = 0, losses = 0;
+      for (let i = 1; i <= period; i++) { const d = prices[i]-prices[i-1]; if (d>0) gains+=d; else losses-=d; }
+      let ag = gains/period, al = losses/period;
+      for (let i = period+1; i < prices.length; i++) { const d = prices[i]-prices[i-1]; ag = (ag*(period-1)+(d>0?d:0))/period; al = (al*(period-1)+(d<0?-d:0))/period; }
+      if (al === 0) return 100; return 100 - 100/(1+ag/al);
+    }
+
+    function calcMACD(prices) {
+      if (prices.length < 26) return { macd:0, signal:0, histogram:0 };
+      const e12 = calcEMA(prices,12), e26 = calcEMA(prices,26);
+      const ml = e12.map((v,i) => v-e26[i]); const sl = calcEMA(ml.slice(-9),9);
+      const m = ml[ml.length-1], s = sl[sl.length-1];
+      return { macd:m, signal:s, histogram:m-s };
+    }
+
+    function calcBB(prices, period = 20) {
+      if (prices.length < period) return null;
+      const sl = prices.slice(-period);
+      const mean = sl.reduce((a,b) => a+b,0)/period;
+      const std = Math.sqrt(sl.reduce((a,b) => a+(b-mean)**2,0)/period);
+      return { upper: mean+2*std, middle: mean, lower: mean-2*std };
+    }
+
+    function calcVWAP(candles) {
+      if (!candles?.length) return null;
+      let cv=0, ct=0;
+      for (const c of candles) { const tp=(c.h+c.l+c.c)/3; cv+=c.v; ct+=tp*c.v; }
+      return cv > 0 ? ct/cv : null;
+    }
+
+    function getSignal(rsi, macd, bb, price, ema9, ema21, vwap) {
+      let score = 0; const reasons = [];
+      if (rsi !== null) {
+        if (rsi<30) { score+=2; reasons.push("RSI oversold ("+rsi.toFixed(1)+")"); }
+        else if (rsi<40) { score+=1; reasons.push("RSI low ("+rsi.toFixed(1)+")"); }
+        else if (rsi>70) { score-=2; reasons.push("RSI overbought ("+rsi.toFixed(1)+")"); }
+        else if (rsi>60) { score-=1; reasons.push("RSI high ("+rsi.toFixed(1)+")"); }
+      }
+      if (macd) {
+        if (macd.histogram>0 && macd.macd>macd.signal) { score+=1; reasons.push("MACD bullish"); }
+        else if (macd.histogram<0 && macd.macd<macd.signal) { score-=1; reasons.push("MACD bearish"); }
+      }
+      if (bb) {
+        const pct = (price-bb.lower)/(bb.upper-bb.lower);
+        if (pct<0.1) { score+=2; reasons.push("Near lower BB"); }
+        else if (pct<0.3) { score+=1; reasons.push("Low in BB range"); }
+        else if (pct>0.9) { score-=2; reasons.push("Near upper BB"); }
+        else if (pct>0.7) { score-=1; reasons.push("High in BB range"); }
+      }
+      if (ema9 && ema21) {
+        if (ema9[ema9.length-1]>ema21[ema21.length-1]) { score+=1; reasons.push("EMA 9 > 21 (bullish)"); }
+        else { score-=1; reasons.push("EMA 9 < 21 (bearish)"); }
+      }
+      if (vwap) {
+        if (price>vwap) { score+=1; reasons.push("Above VWAP"); }
+        else { score-=1; reasons.push("Below VWAP"); }
+      }
+      let dir, conf, col;
+      if (score>=3) { dir="STRONG UP"; conf="High"; col="#10b981"; }
+      else if (score>=1) { dir="UP"; conf="Medium"; col="#34d399"; }
+      else if (score<=-3) { dir="STRONG DOWN"; conf="High"; col="#ef4444"; }
+      else if (score<=-1) { dir="DOWN"; conf="Medium"; col="#f87171"; }
+      else { dir="NEUTRAL"; conf="Low"; col="#f59e0b"; }
+      return { direction:dir, confidence:conf, score, reasons, color:col };
+    }
+
+    function MiniChart({ prices }) {
+      if (!prices || prices.length < 2) return null;
+      const W=500, H=80;
+      const min=Math.min(...prices), max=Math.max(...prices), range=max-min||1;
+      const pts = prices.map((p,i) => `${(i/(prices.length-1))*W},${H-((p-min)/range)*(H-10)-5}`).join(" ");
+      const col = prices[prices.length-1] >= prices[0] ? "#10b981" : "#ef4444";
+      return (
+        <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{display:"block"}}>
+          <defs><linearGradient id="cg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={col} stopOpacity="0.3"/><stop offset="100%" stopColor={col} stopOpacity="0"/></linearGradient></defs>
+          <polygon points={`0,${H} ${pts} ${W},${H}`} fill="url(#cg)"/>
+          <polyline points={pts} fill="none" stroke={col} strokeWidth="2" strokeLinejoin="round"/>
+        </svg>
+      );
+    }
+
+    function App() {
+      const [price, setPrice] = useState(null);
+      const [prevPrice, setPrevPrice] = useState(null);
+      const [candles, setCandles] = useState([]);
+      const [signal, setSignal] = useState(null);
+      const [lastUpdate, setLastUpdate] = useState(null);
+      const [error, setError] = useState(null);
+      const [loading, setLoading] = useState(true);
+      const [trades, setTrades] = useState([]);
+      const [stats, setStats] = useState({ wins:0, losses:0, total:0 });
+      const [countdown, setCountdown] = useState(300);
+      const [apiSource, setApiSource] = useState("");
+      const pRef = useRef(null);
+      const workingApiRef = useRef(null);
+
+      const tryFetch = useCallback(async (api) => {
+        const [cp, cd] = await Promise.all([api.price(), api.klines()]);
+        return { price: cp, candles: cd, name: api.name };
+      }, []);
+
+      const fetchData = useCallback(async () => {
+        let result = null;
+
+        // Try the last working API first
+        if (workingApiRef.current) {
+          try {
+            result = await tryFetch(workingApiRef.current);
+          } catch(e) {
+            workingApiRef.current = null;
+          }
+        }
+
+        // If that failed, try all APIs
+        if (!result) {
+          for (const api of APIS) {
+            try {
+              result = await tryFetch(api);
+              workingApiRef.current = api;
+              break;
+            } catch(e) { continue; }
+          }
+        }
+
+        if (!result) {
+          setError("All data sources failed. Check your internet connection and try again.");
+          setLoading(false);
+          return;
+        }
+
+        const { price: cp, candles: cd, name } = result;
+        setPrevPrice(pRef.current); pRef.current = cp; setPrice(cp);
+        setCandles(cd); setApiSource(name);
+
+        const cl = cd.map(c => c.c);
+        const rsi = calcRSI(cl), macd = calcMACD(cl), bb = calcBB(cl);
+        const e9 = calcEMA(cl,9), e21 = calcEMA(cl,21), vwap = calcVWAP(cd);
+        const sig = getSignal(rsi, macd, bb, cp, e9, e21, vwap);
+        setSignal({ ...sig, rsi, macd, bb, vwap });
+        setLastUpdate(new Date()); setError(null); setLoading(false);
+        const now = Date.now(), fm = 5*60*1000;
+        setCountdown(Math.ceil((fm-(now%fm))/1000));
+      }, [tryFetch]);
+
+      const fetchPrice = useCallback(async () => {
+        for (const api of APIS) {
+          try { return await api.price(); } catch(e) { continue; }
+        }
+        return null;
+      }, []);
+
+      const recordTrade = (dir) => {
+        if (!price) return;
+        const trade = { id: Date.now(), entry: price, direction: dir, time: new Date().toLocaleTimeString(), status: "open" };
+        setTrades(prev => [trade, ...prev]);
+        setTimeout(async () => {
+          try {
+            const ep = await fetchPrice();
+            if (!ep) return;
+            const won = dir === "UP" ? ep > trade.entry : ep < trade.entry;
+            setTrades(prev => prev.map(t => t.id===trade.id ? {...t, exit:ep, status:won?"win":"loss"} : t));
+            setStats(prev => ({ wins:prev.wins+(won?1:0), losses:prev.losses+(won?0:1), total:prev.total+1 }));
+          } catch(e) {}
+        }, 5*60*1000);
+      };
+
+      useEffect(() => {
+        fetchData();
+        const di = setInterval(fetchData, 15000);
+        const ci = setInterval(() => setCountdown(p => p>0 ? p-1 : 300), 1000);
+        return () => { clearInterval(di); clearInterval(ci); };
+      }, [fetchData]);
+
+      const pc = prevPrice ? (price>prevPrice ? "#10b981" : price<prevPrice ? "#ef4444" : "#e2e8f0") : "#e2e8f0";
+      const closes = candles.map(c => c.c);
+      const wr = stats.total > 0 ? ((stats.wins/stats.total)*100).toFixed(1) : "—";
+
+      const card = { background:"rgba(30,27,75,0.6)", borderRadius:16, border:"1px solid rgba(99,102,241,0.2)", padding:20, marginBottom:16 };
+      const pill = { background:"rgba(15,23,42,0.5)", borderRadius:10, padding:12, textAlign:"center" };
+
+      return (
+        <div style={{ padding:20, maxWidth:560, margin:"0 auto" }}>
+          <div style={{ textAlign:"center", marginBottom:24 }}>
+            <h1 style={{ fontSize:22, fontWeight:700, background:"linear-gradient(90deg, #818cf8, #c084fc)", WebkitBackgroundClip:"text", WebkitTextFillColor:"transparent" }}>BTC 5-MIN SIGNAL</h1>
+            <p style={{ fontSize:11, color:"#94a3b8", marginTop:4 }}>Technical Analysis Dashboard</p>
+          </div>
+
+          {loading ? <div style={{textAlign:"center",padding:60,color:"#94a3b8"}}>
+            <div style={{fontSize:14,marginBottom:8}}>Connecting to data sources...</div>
+            <div style={{fontSize:11,color:"#64748b"}}>Trying Bybit → Kraken → CoinGecko</div>
+          </div>
+          : error ? <div style={{...card, background:"rgba(239,68,68,0.15)", border:"1px solid rgba(239,68,68,0.3)", textAlign:"center", color:"#fca5a5"}}>
+            <div style={{marginBottom:8}}>{error}</div>
+            <div style={{fontSize:10,color:"#f87171",marginBottom:12}}>This can happen if your network blocks crypto APIs. Try using a VPN.</div>
+            <button onClick={fetchData} style={{padding:"8px 20px",background:"#6366f1",border:"none",borderRadius:8,color:"white",cursor:"pointer",fontFamily:"inherit"}}>Retry</button>
+          </div>
+          : <>
+            {/* Price */}
+            <div style={card}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div>
+                  <div style={{fontSize:11,color:"#94a3b8",marginBottom:4}}>BTC/USD <span style={{fontSize:9,color:"#64748b",marginLeft:6}}>via {apiSource}</span></div>
+                  <div style={{fontSize:32,fontWeight:700,color:pc,letterSpacing:"-1px"}}>${price?.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
+                </div>
+                <div style={{textAlign:"right"}}>
+                  <div style={{fontSize:11,color:"#94a3b8"}}>Next candle</div>
+                  <div style={{fontSize:20,fontWeight:600,color:"#818cf8"}}>{Math.floor(countdown/60)}:{(countdown%60).toString().padStart(2,"0")}</div>
+                </div>
+              </div>
+              <div style={{marginTop:12}}><MiniChart prices={closes}/></div>
+              <div style={{fontSize:10,color:"#64748b",marginTop:8}}>Updated {lastUpdate?.toLocaleTimeString()}</div>
+            </div>
+
+            {/* Signal */}
+            {signal && <div style={{...card, border:`1px solid ${signal.color}33`}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+                <div>
+                  <div style={{fontSize:11,color:"#94a3b8"}}>SIGNAL</div>
+                  <div style={{fontSize:28,fontWeight:800,color:signal.color}}>
+                    {signal.direction==="STRONG UP"?"⬆️":signal.direction==="UP"?"↗️":signal.direction==="STRONG DOWN"?"⬇️":signal.direction==="DOWN"?"↘️":"➡️"} {signal.direction}
+                  </div>
+                </div>
+                <div style={{padding:"6px 14px",borderRadius:20,background:signal.confidence==="High"?"rgba(16,185,129,0.2)":signal.confidence==="Medium"?"rgba(245,158,11,0.2)":"rgba(148,163,184,0.2)",color:signal.confidence==="High"?"#10b981":signal.confidence==="Medium"?"#f59e0b":"#94a3b8",fontSize:12,fontWeight:600}}>
+                  {signal.confidence} Confidence
+                </div>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:16}}>
+                {[
+                  {label:"RSI (14)",value:signal.rsi?.toFixed(1)??"—",sub:signal.rsi<30?"Oversold":signal.rsi>70?"Overbought":"Neutral",color:signal.rsi<30?"#10b981":signal.rsi>70?"#ef4444":"#94a3b8"},
+                  {label:"MACD",value:signal.macd?.histogram?.toFixed(2)??"—",sub:signal.macd?.histogram>0?"Bullish":"Bearish",color:signal.macd?.histogram>0?"#10b981":"#ef4444"},
+                  {label:"VWAP",value:signal.vwap?"$"+signal.vwap.toFixed(0):"—",sub:price>signal.vwap?"Above":"Below",color:price>signal.vwap?"#10b981":"#ef4444"}
+                ].map((ind,i) => <div key={i} style={pill}><div style={{fontSize:10,color:"#64748b",marginBottom:4}}>{ind.label}</div><div style={{fontSize:16,fontWeight:700,color:"#e2e8f0"}}>{ind.value}</div><div style={{fontSize:10,color:ind.color,marginTop:2}}>{ind.sub}</div></div>)}
+              </div>
+              <div>{signal.reasons.map((r,i) => <span key={i} style={{display:"inline-block",background:"rgba(15,23,42,0.5)",borderRadius:6,padding:"3px 8px",margin:"2px 4px 2px 0",fontSize:10,color:"#94a3b8"}}>{r}</span>)}</div>
+            </div>}
+
+            {/* Paper Trading */}
+            <div style={card}>
+              <div style={{fontSize:11,color:"#94a3b8",marginBottom:12}}>PAPER TRADE TRACKER</div>
+              <div style={{display:"flex",gap:10,marginBottom:16}}>
+                <button onClick={()=>recordTrade("UP")} style={{flex:1,padding:12,background:"rgba(16,185,129,0.2)",border:"1px solid rgba(16,185,129,0.4)",borderRadius:10,color:"#10b981",fontWeight:700,cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>↑ BET UP</button>
+                <button onClick={()=>recordTrade("DOWN")} style={{flex:1,padding:12,background:"rgba(239,68,68,0.2)",border:"1px solid rgba(239,68,68,0.4)",borderRadius:10,color:"#ef4444",fontWeight:700,cursor:"pointer",fontSize:14,fontFamily:"inherit"}}>↓ BET DOWN</button>
+              </div>
+              <div style={{display:"flex",gap:10,marginBottom:12}}>
+                {[{l:"Trades",v:stats.total},{l:"Wins",v:stats.wins,c:"#10b981"},{l:"Losses",v:stats.losses,c:"#ef4444"},{l:"Win Rate",v:wr+"%",c:"#818cf8"}].map((s,i)=>
+                  <div key={i} style={{flex:1,...pill,padding:10}}><div style={{fontSize:9,color:"#64748b"}}>{s.l}</div><div style={{fontSize:16,fontWeight:700,color:s.c||"#e2e8f0"}}>{s.v}</div></div>
+                )}
+              </div>
+              {trades.length > 0 && <div style={{maxHeight:150,overflowY:"auto"}}>
+                {trades.slice(0,10).map(t => <div key={t.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"6px 0",borderBottom:"1px solid rgba(99,102,241,0.1)",fontSize:11}}>
+                  <span style={{color:t.direction==="UP"?"#10b981":"#ef4444"}}>{t.direction==="UP"?"↑":"↓"} {t.direction}</span>
+                  <span style={{color:"#94a3b8"}}>${t.entry?.toLocaleString()}</span>
+                  <span style={{color:"#64748b"}}>{t.time}</span>
+                  <span style={{color:t.status==="win"?"#10b981":t.status==="loss"?"#ef4444":"#f59e0b",fontWeight:600}}>{t.status==="open"?"⏳ Pending":t.status==="win"?"✅ Win":"❌ Loss"}</span>
+                </div>)}
+              </div>}
+            </div>
+
+            <div style={{background:"rgba(245,158,11,0.1)",border:"1px solid rgba(245,158,11,0.2)",borderRadius:12,padding:14,fontSize:10,color:"#fbbf24",lineHeight:1.5}}>
+              ⚠️ <strong>NOT FINANCIAL ADVICE.</strong> Technical indicators cannot reliably predict 5-minute movements. Never trade money you can't afford to lose.
+            </div>
+          </>}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>
